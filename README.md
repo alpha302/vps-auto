@@ -10,7 +10,7 @@ Ubuntu VPS 初始化脚本 [`vps_auto_work_cc.sh`](vps_auto_work_cc.sh) 的**公
 curl -fsSL https://raw.githubusercontent.com/alpha302/vps-auto/main/install.sh | sudo bash
 ```
 
-脚本将安装到 `/root/.1/vps_auto_work_cc.sh`。
+脚本将安装到 `/root/.1/vps_auto_work_cc.sh` 与 `/root/.1/install-tools.sh`（供 `-mcp-apt` 使用）。
 
 ## 检查 / 更新
 

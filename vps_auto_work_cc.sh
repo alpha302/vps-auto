@@ -16,7 +16,7 @@
 set -uo pipefail
 
 # ───────────────────────── 基础变量 ─────────────────────────
-SCRIPT_VERSION="1.5.0"
+SCRIPT_VERSION="1.5.1"
 SCRIPT_NAME="$(basename "$0")"
 LOG_FILE="/var/log/vps_init.log"
 REGION_CONFIG="/etc/vps_init.conf"
@@ -4201,6 +4201,8 @@ resolve_install_tools_sh() {
   local csai_root installer
   csai_root="$(resolve_csai_root 2>/dev/null || true)"
   for installer in \
+    "${DEFAULT_SCRIPT_PATH%/*}/install-tools.sh" \
+    "/root/.1/install-tools.sh" \
     "${csai_root:+$csai_root/install-tools.sh}" \
     "/root/git/CyberStrikeAI/install-tools.sh" \
     "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." 2>/dev/null && pwd)/install-tools.sh"; do

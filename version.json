@@ -1,7 +1,7 @@
 {
-  "version": "1.5.1",
+  "version": "1.5.2",
   "script_url": "https://raw.githubusercontent.com/alpha302/vps-auto/main/vps_auto_work_cc.sh",
-  "sha256": "ab7d4472b492f993cab964941b1f1aa8e6a5e229a67ea15f589596b8821f1c23",
-  "released_at": "2026-07-23T09:46:55Z",
-  "changelog": "v1.5.1: 同步 install-tools.sh，install.sh 一并安装"
+  "sha256": "0b7ea202b36a45a02fcbe5e83a58c7169c081985322de2aab3a5f59a7e26ed43",
+  "released_at": "2026-07-27T07:58:24Z",
+  "changelog": "feat(vps): v1.5.2 PVE客户机、apt国内源、companion同步与npm镜像"
 }

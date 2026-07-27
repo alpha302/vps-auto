@@ -16,13 +16,17 @@
 set -uo pipefail
 
 # ───────────────────────── 基础变量 ─────────────────────────
-SCRIPT_VERSION="1.5.1"
+SCRIPT_VERSION="1.5.2"
 SCRIPT_NAME="$(basename "$0")"
 LOG_FILE="/var/log/vps_init.log"
 REGION_CONFIG="/etc/vps_init.conf"
 UPDATE_MANIFEST_URL="https://raw.githubusercontent.com/alpha302/vps-auto/main/version.json"
 UPDATE_CONFIG="/etc/vps_auto/update.conf"
+UPDATE_BASE_RAW="https://raw.githubusercontent.com/alpha302/vps-auto/main"
 DEFAULT_SCRIPT_PATH="/root/.1/vps_auto_work_cc.sh"
+DEFAULT_INSTALL_DIR="/root/.1"
+DEFAULT_INSTALL_TOOLS_PATH="${DEFAULT_INSTALL_DIR}/install-tools.sh"
+DEFAULT_INSTALL_SH_PATH="${DEFAULT_INSTALL_DIR}/install.sh"
 ZSHRC="${HOME}/.zshrc"
 [ "$(id -u)" -eq 0 ] && ZSHRC="/root/.zshrc"
 IS_CN=""              # yes=国内镜像 / no=海外官方源
@@ -218,7 +222,7 @@ resume_background_apt() {
 # 需要走 apt 安装/更新的子命令（启用 pause + EXIT 恢复）
 needs_apt_guard() {
   case "${1:-}" in
-    -h|--help|-region|""|-ssh-check|-time-check|-traffic-check|-update-check|-update|-sectools-check|-sectools-help|-java|-go|-swap|-noproxy)
+    -h|--help|-region|""|-ssh-check|-time-check|-traffic-check|-update-check|-update|-update-tools|-sectools-check|-sectools-help|-java|-go|-swap|-noproxy)
       return 1 ;;
     *) return 0 ;;
   esac
@@ -914,7 +918,23 @@ break-system-packages = true"
   else
     ok "判断为【海外】服务器，使用官方 pypi 源，已启用 break-system-packages 绕过 PEP668 限制"
   fi
+  setup_npm_mirror_cn
   warn "如需严格依赖隔离，建议改用: python3 -m venv venv && ./venv/bin/pip install -r requirements.txt"
+}
+
+# npm 国内镜像（install-tools.sh 中 spectral 等 npm 包装需要）
+setup_npm_mirror_cn() {
+  [ "$IS_CN" = "yes" ] || return 0
+  if ! command -v npm >/dev/null 2>&1; then
+    log "npm 未安装，跳过 registry 配置（安装 Node.js 后重新 -pip 或 -update-tools）"
+    return 0
+  fi
+  npm config set registry https://registry.npmmirror.com --global >> "$LOG_FILE" 2>&1 \
+    && ok "npm registry → registry.npmmirror.com" \
+    || warn "npm registry 配置失败"
+  mkdir -p /root/.npm
+  echo "registry=https://registry.npmmirror.com" > /root/.npmrc
+  ok "已写入 /root/.npmrc"
 }
 
 # ───────────────────────── 5. 卸载国内云监控 agent ─────────────────────────
@@ -1407,6 +1427,64 @@ export GOPATH=${gopath}
 EOF
 
   ok "Golang ${go_ver} 安装完成: $(/usr/local/go/bin/go version 2>/dev/null)"
+}
+
+# ───────────────────────── apt 国内镜像（Ubuntu 22/24 官方源检测与替换）─────────────────────────
+apt_uses_official_ubuntu_mirror() {
+  local f
+  for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+    [ -f "$f" ] || continue
+    if grep -qE 'https?://(archive|security|ports)\.ubuntu\.com' "$f" 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+apply_apt_mirror_aliyun() {
+  local codename ts
+  codename="$(get_ubuntu_codename 2>/dev/null || true)"
+  [ -n "$codename" ] || { warn "无法识别 Ubuntu 代号，跳过 apt 源替换"; return 1; }
+
+  ts=$(date +%Y%m%d%H%M%S)
+  if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+    cp -a /etc/apt/sources.list.d/ubuntu.sources "/etc/apt/sources.list.d/ubuntu.sources.bak.${ts}"
+    sed -i \
+      -e 's|http://archive.ubuntu.com/ubuntu/|http://mirrors.aliyun.com/ubuntu/|g' \
+      -e 's|http://security.ubuntu.com/ubuntu/|http://mirrors.aliyun.com/ubuntu/|g' \
+      -e 's|https://archive.ubuntu.com/ubuntu/|http://mirrors.aliyun.com/ubuntu/|g' \
+      -e 's|https://security.ubuntu.com/ubuntu/|http://mirrors.aliyun.com/ubuntu/|g' \
+      /etc/apt/sources.list.d/ubuntu.sources
+    ok "已切换 DEB822 源 → 阿里云（${codename}，备份 *.bak.${ts}）"
+    return 0
+  fi
+
+  if [ -f /etc/apt/sources.list ]; then
+    cp -a /etc/apt/sources.list "/etc/apt/sources.list.bak.${ts}"
+    sed -i \
+      -e 's|http://archive.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g' \
+      -e 's|http://security.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g' \
+      -e 's|http://ports.ubuntu.com/ubuntu-ports|http://mirrors.aliyun.com/ubuntu-ports|g' \
+      -e 's|https://archive.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g' \
+      -e 's|https://security.ubuntu.com/ubuntu|http://mirrors.aliyun.com/ubuntu|g' \
+      /etc/apt/sources.list
+    ok "已切换 sources.list → 阿里云（${codename}，备份 *.bak.${ts}）"
+    return 0
+  fi
+
+  warn "未找到 sources.list / ubuntu.sources，跳过 apt 源替换"
+  return 1
+}
+
+maybe_setup_apt_mirror_cn() {
+  [ "$IS_CN" = "yes" ] || return 0
+  if apt_uses_official_ubuntu_mirror; then
+    log "国内环境且检测到 Ubuntu 官方 apt 源，替换为阿里云镜像..."
+    apply_apt_mirror_aliyun || return 1
+    apt_update || warn "切换镜像后 apt-get update 失败"
+  else
+    log "apt 源已为国内/云厂商镜像或非 Ubuntu 官方，跳过替换"
+  fi
 }
 
 # ───────────────────────── 8. masscan / nmap ─────────────────────────
@@ -4762,6 +4840,26 @@ setup_ssh_login() {
   ok "SSH 远程登录配置完成"
 }
 
+# ───────────────────────── PVE 虚拟机客户机依赖 ─────────────────────────
+setup_pve_guest() {
+  log "===== PVE 虚拟机客户机依赖（cloud-init / qemu-guest-agent / SSH）====="
+  maybe_setup_apt_mirror_cn || true
+  apt_update || warn "apt-get update 失败"
+  apt_install cloud-init qemu-guest-agent openssh-server || return 1
+  if systemctl list-unit-files qemu-guest-agent.service >/dev/null 2>&1; then
+    systemctl enable qemu-guest-agent >> "$LOG_FILE" 2>&1 || true
+    systemctl restart qemu-guest-agent >> "$LOG_FILE" 2>&1 || true
+    ok "qemu-guest-agent 已启用"
+  else
+    warn "未找到 qemu-guest-agent.service"
+  fi
+  if command -v cloud-init >/dev/null 2>&1; then
+    ok "cloud-init: $(cloud-init --version 2>&1 | head -1)"
+  fi
+  setup_ssh_login "${1:-}"
+  ok "PVE 客户机初始化完成"
+}
+
 # ───────────────────────── 自更新（公开仓 alpha302/vps-auto）─────────────────────────
 load_update_config() {
   UPDATE_MANIFEST_URL_EFFECTIVE="$UPDATE_MANIFEST_URL"
@@ -4786,6 +4884,40 @@ resolve_script_path() {
     return 0
   fi
   readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0"
+}
+
+resolve_update_base_raw() {
+  load_update_config
+  echo "${UPDATE_BASE_RAW:-https://raw.githubusercontent.com/alpha302/vps-auto/main}"
+}
+
+# 从公开仓同步 install-tools.sh / install.sh 到 /root/.1/
+sync_companion_scripts() {
+  local base dir f url dest
+  base="$(resolve_update_base_raw)"
+  dir="${DEFAULT_INSTALL_DIR}"
+  mkdir -p "$dir"
+  for f in install-tools.sh install.sh; do
+    url="${base}/${f}"
+    dest="${dir}/${f}"
+    log "同步 companion: ${f} ..."
+    if ! run_without_proxy curl -fsSL --max-time 120 "$url" -o "${dest}.new" >> "$LOG_FILE" 2>&1; then
+      warn "下载失败: ${url}"
+      rm -f "${dest}.new"
+      continue
+    fi
+    if ! bash -n "${dest}.new" 2>>"$LOG_FILE"; then
+      warn "${f} 语法检查失败 (bash -n)，未替换"
+      rm -f "${dest}.new"
+      continue
+    fi
+    if [ -f "$dest" ]; then
+      cp -a "$dest" "${dest}.bak.$(date +%Y%m%d%H%M%S)"
+    fi
+    install -m 755 "${dest}.new" "$dest"
+    rm -f "${dest}.new"
+    ok "已同步: ${dest}"
+  done
 }
 
 fetch_update_manifest() {
@@ -4869,7 +5001,8 @@ perform_update() {
     return 1
   fi
   if [ "$remote_ver" = "$SCRIPT_VERSION" ]; then
-    ok "已是最新版本 (${SCRIPT_VERSION})，无需更新"
+    ok "已是最新版本 (${SCRIPT_VERSION})，同步 companion 脚本..."
+    sync_companion_scripts
     return 0
   fi
 
@@ -4913,6 +5046,7 @@ perform_update() {
   install -m 755 "$new_script" "$target"
   rm -rf "$tmpdir"
   ok "已更新至 v${remote_ver}: ${target}"
+  sync_companion_scripts
   ok "请重新运行: sudo bash ${target} -h"
 }
 
@@ -4929,6 +5063,7 @@ print_usage() {
 
   ── 基础环境 ────────────────────────────────────────────────
   -all        依次执行: 时间同步(上海时区)/zsh/swap/docker/pip/java/go/scan/beauty/noproxy/流量统计
+              国内环境会自动检测 Ubuntu 官方 apt 源并替换为阿里云镜像（22/24）
               运行时会交互询问地区（含香港/港澳台选项），不安装 clash
               （clash 需确认海外环境后单独执行 -clash）
   -zsh        安装并配置 zsh + oh-my-zsh + 插件 + 彩色终端
@@ -4980,6 +5115,11 @@ print_usage() {
   -uncover    安装 uncover（Hunter/FOFA/Quake 等空间引擎 CLI，go install）
   -mcp-apt     安装 CyberStrikeAI MCP 工具中 apt 可提供的部分（调用 install-tools.sh --method apt）
   -mcp-apt-check  仅查看 MCP 工具 install-tools.sh --check 状态
+  -update-tools  从公开仓同步 install-tools.sh + install.sh 到 ${DEFAULT_INSTALL_DIR}/
+
+  ── PVE 虚拟机客户机 ─────────────────────────────────────────
+  -pve [公钥文件或公钥字符串]
+              安装 cloud-init + qemu-guest-agent，并配置 SSH 公钥+root 密码登录
 
   ── 其他 ────────────────────────────────────────────────────
   -clash      安装 mihomo 并指定 clash 配置文件（yaml 路径或订阅 URL）
@@ -4997,6 +5137,7 @@ print_usage() {
               再次运行不带参数将复用上次配置；带新路径则更换配置
   -update-check  检查公开仓 alpha302/vps-auto 是否有新版本（不修改本地文件）
   -update        从公开仓下载并更新本脚本（bash -n + SHA256 校验，自动备份旧版）
+              同时同步 install-tools.sh / install.sh 到 ${DEFAULT_INSTALL_DIR}/
   -remove     卸载所有云厂商监控 agent（阿里云/腾讯云/华为云/百度云通用）
   -aliyun     阿里云 ECS 专项清理（先预扫描，确认后清理，覆盖以下组件）
               · 云监控 CloudMonitor / ArgusAgent
@@ -5011,7 +5152,7 @@ EOF
 # 不需要地区镜像策略的命令（无需 root 的已在 main 提前处理）
 needs_region() {
   case "${1:-}" in
-    -h|--help|-region|""|-remove|-aliyun|-dns|-time|-time-check|-traffic-check|-update-check|-update|-noproxy) return 1 ;;
+    -h|--help|-region|""|-remove|-aliyun|-dns|-time|-time-check|-traffic-check|-update-check|-update|-update-tools|-noproxy) return 1 ;;
     # 安全工具安装不依赖镜像源选择，跳过地区交互
     -sectools|-sectools-check|-sectools-help|-scan|-oneforall|-enscan|-subfinder|-amass|-nuclei|-httpx|-naabu|-dnsx|-shuffledns|-ehole|-urlfinder|-gowitness|-favup|-fscan|-uncover|-mcp-apt|-mcp-apt-check|-ssh|-ssh-check|-clash-harden|-cnvd-vpn|-bugbox-vpn|-task-vpn) return 1 ;;
     *) return 0 ;;
@@ -5052,6 +5193,12 @@ main() {
       fi
       touch "$LOG_FILE" 2>/dev/null || true
       check_for_update
+      exit $?
+      ;;
+    -update-tools)
+      require_root
+      touch "$LOG_FILE"
+      sync_companion_scripts
       exit $?
       ;;
     -sectools-check)
@@ -5099,6 +5246,7 @@ main() {
 
   case "$cmd" in
     -all)
+      maybe_setup_apt_mirror_cn || true
       setup_time_sync
       install_zsh
       setup_swap
@@ -5154,6 +5302,7 @@ main() {
     -mcp-apt)   install_mcp_apt_tools ;;
     -mcp-apt-check) check_mcp_apt_tools ;;
     -ssh)       setup_ssh_login "${2:-}" ;;
+    -pve)       setup_pve_guest "${2:-}" ;;
     -sectools)  install_sectools ;;
     -update)    perform_update ;;
     *) err "未知选项: $cmd"; print_usage; exit 1 ;;

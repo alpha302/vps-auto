@@ -1,7 +1,7 @@
 {
   "version": "1.5.2",
   "script_url": "https://raw.githubusercontent.com/alpha302/vps-auto/main/vps_auto_work_cc.sh",
-  "sha256": "0b7ea202b36a45a02fcbe5e83a58c7169c081985322de2aab3a5f59a7e26ed43",
-  "released_at": "2026-07-27T07:58:24Z",
-  "changelog": "feat(vps): v1.5.2 PVE客户机、apt国内源、companion同步与npm镜像"
+  "sha256": "35833dea3f25cf6b05f01d747e744867097c2a4e9b462da3d629fc6b1b7b25bd",
+  "released_at": "2026-07-27T07:58:59Z",
+  "changelog": "fix(vps): mcp-apt-check 提示 -update-tools"
 }

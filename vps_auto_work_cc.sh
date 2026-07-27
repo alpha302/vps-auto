@@ -4368,6 +4368,7 @@ check_mcp_apt_tools() {
     return 0
   fi
   warn "未找到 install-tools.sh，无法汇总 MCP 工具状态"
+  echo -e "  同步脚本: ${C_YEL}sudo bash ${SCRIPT_NAME} -update-tools${C_NC}"
   echo ""
   return 1
 }

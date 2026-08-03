@@ -16,7 +16,7 @@
 set -uo pipefail
 
 # ───────────────────────── 基础变量 ─────────────────────────
-SCRIPT_VERSION="1.5.2"
+SCRIPT_VERSION="1.5.3"
 SCRIPT_NAME="$(basename "$0")"
 LOG_FILE="/var/log/vps_init.log"
 REGION_CONFIG="/etc/vps_init.conf"
@@ -2492,8 +2492,8 @@ ensure_mihomo_running_for_proxy() {
   fi
 
   # 有 GEO 才能正常启动并监听端口
-  if [ ! -s "${mihomo_cfg}/geoip.dat" ] || [ ! -s "${mihomo_cfg}/geosite.dat" ]; then
-    warn "GEO 数据库未就绪，mihomo 无法开启代理端口，请先完成 GEO 下载"
+  if [ ! -s "${mihomo_cfg}/geoip.dat" ] || [ ! -s "${mihomo_cfg}/geosite.dat" ] || [ ! -s "${mihomo_cfg}/country.mmdb" ]; then
+    warn "GEO/MMDB 未就绪（需 geoip.dat + geosite.dat + country.mmdb），mihomo 无法开启代理端口"
     return 1
   fi
 
@@ -2581,24 +2581,42 @@ download_url_smart() {
   download_via_local_proxy "$url" "$dest" "$(get_mihomo_proxy_port)" "$timeout"
 }
 
-# GEO 大文件专用下载（ghfast 优先，长超时；禁用 shell 代理，终端显示耗时）
+# MetaCubeX/meta-rules-dat 国内优先镜像（MMDB/geoip/geosite；无代理可下载）
+meta_rules_dat_mirror_urls() {
+  local file="$1"
+  local gh="https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/${file}"
+  printf '%s\n' \
+    "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/${file}" \
+    "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/${file}" \
+    "https://hub.keccak.top/MetaCubeX/meta-rules-dat/releases/download/latest/${file}" \
+    "https://ghfast.top/${gh}" \
+    "https://ghproxy.net/${gh}" \
+    "https://mirror.ghproxy.com/${gh}" \
+    "${gh}"
+}
+
+# mihomo geox-url 国内镜像（内核自动拉 MMDB 时使用，避免直连 GitHub）
+mihomo_geox_mirror_urls() {
+  echo "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.dat"
+  echo "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.dat"
+  echo "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/country.mmdb"
+  echo "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/GeoLite2-ASN.mmdb"
+}
+
+# GEO / MMDB 大文件专用下载（国内 CDN 优先，长超时；禁用 shell 代理）
 download_geo_file() {
-  local url="$1"
-  local dest="$2"
+  local dest="$1"
   local name
   name=$(basename "$dest")
   local timeout=600
 
   if [ -n "${http_proxy:-}${HTTP_PROXY:-}${all_proxy:-}${ALL_PROXY:-}" ]; then
-    warn "检测到 shell 代理环境变量（clash on 残留），GEO 下载将绕过代理直连镜像"
+    warn "检测到 shell 代理环境变量，GEO/MMDB 下载将绕过代理直连国内镜像"
   fi
 
   local u
-  for u in \
-    "https://ghfast.top/${url}" \
-    "https://ghproxy.net/${url}" \
-    "https://mirror.ghproxy.com/${url}" \
-    "${url}"; do
+  while IFS= read -r u; do
+    [ -z "$u" ] && continue
     log "下载 ${name} ←"
     log "  ${u}"
     log "  单源最长 ${timeout}s，下方显示已用时间..."
@@ -2613,44 +2631,46 @@ download_geo_file() {
     fi
     rm -f "$dest"
     warn "${name} 当前源失败，尝试下一镜像..."
-  done
-  warn "${name} 所有源均失败"
+  done < <(meta_rules_dat_mirror_urls "$name")
+  warn "${name} 所有镜像均失败"
   return 1
 }
 
-# 下载 GeoIP / GeoSite（大文件长超时；GEO 必须先于 mihomo 代理）
+# 下载 GeoIP / GeoSite / MMDB（必须先于 mihomo 代理端口就绪）
 download_geo_databases() {
   local mihomo_cfg="/etc/mihomo"
   local mihomo_bin="/usr/local/bin/mihomo"
-  local geoip_url="https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/geoip.dat"
-  local geosite_url="https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/geosite.dat"
   local port
   port=$(get_mihomo_proxy_port)
 
-  if [ -s "${mihomo_cfg}/geoip.dat" ] && [ -s "${mihomo_cfg}/geosite.dat" ]; then
-    ok "GEO 数据库已存在，跳过下载"
+  if [ -s "${mihomo_cfg}/geoip.dat" ] && [ -s "${mihomo_cfg}/geosite.dat" ] \
+     && [ -s "${mihomo_cfg}/country.mmdb" ]; then
+    ok "GEO/MMDB 已存在，跳过下载"
     return 0
   fi
 
-  # 缺 GEO 时 mihomo 会卡在 MMDB 且不监听 7890
+  # 缺 GEO/MMDB 时 mihomo 会卡死并尝试直连 GitHub 下载
   if systemctl is-active --quiet mihomo 2>/dev/null || pgrep -f "${mihomo_bin} -d ${mihomo_cfg}" >/dev/null 2>&1; then
     if ! is_mihomo_proxy_ready "$port"; then
-      warn "mihomo 运行中但端口 ${port} 未就绪，先停止以便下载 GEO..."
+      warn "mihomo 运行中但端口 ${port} 未就绪，先停止以便下载 GEO/MMDB..."
       systemctl stop mihomo >> "$LOG_FILE" 2>&1 || true
       pkill -f "${mihomo_bin} -d ${mihomo_cfg}" >> "$LOG_FILE" 2>&1 || true
       sleep 2
     fi
   fi
 
-  local geo_ok=0
-  if download_geo_file "$geoip_url" "${mihomo_cfg}/geoip.dat" \
-    && download_geo_file "$geosite_url" "${mihomo_cfg}/geosite.dat"; then
-    geo_ok=1
-    ok "GEO 数据库下载完成"
+  local geo_ok=1 f
+  for f in geoip.dat geosite.dat country.mmdb; do
+    [ -s "${mihomo_cfg}/${f}" ] && continue
+    download_geo_file "${mihomo_cfg}/${f}" || geo_ok=0
+  done
+
+  if [ "$geo_ok" -eq 1 ]; then
+    ok "GEO/MMDB 数据库下载完成（geoip.dat + geosite.dat + country.mmdb）"
   else
-    warn "GEO 下载失败（rule 模式 + GEOIP 规则需要此文件，否则 mihomo 无法正常工作）"
-    warn "手动下载: curl -fL --max-time 600 -o /etc/mihomo/geoip.dat \\"
-    warn "  'https://ghfast.top/${geoip_url}'"
+    warn "GEO/MMDB 下载不完整（mihomo 需 geoip.dat / geosite.dat / country.mmdb）"
+    warn "手动示例: curl -fL -o /etc/mihomo/country.mmdb \\"
+    warn "  'https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/country.mmdb'"
   fi
 
   if [ "$geo_ok" -eq 1 ] && [ -f /etc/systemd/system/mihomo.service ]; then
@@ -2845,7 +2865,45 @@ harden_mihomo_config() {
   fi
 
   ok "mihomo 已加固: allow-lan=false, bind-address=127.0.0.1, log-level=warning"
+  inject_mihomo_geox_mirrors "$dest"
   warn "订阅更新后若恢复 allow-lan:true，请重新执行: sudo bash ${SCRIPT_NAME} -clash-harden"
+}
+
+# 注入 geox-url 国内镜像，避免 mihomo 启动时直连 GitHub 拉 MMDB
+inject_mihomo_geox_mirrors() {
+  local dest="$1"
+  [ -f "$dest" ] || return 1
+
+  local geoip_m geosite_m mmdb_m asn_m
+  mapfile -t _geox < <(mihomo_geox_mirror_urls)
+  geoip_m="${_geox[0]:-https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.dat}"
+  geosite_m="${_geox[1]:-https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.dat}"
+  mmdb_m="${_geox[2]:-https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/country.mmdb}"
+  asn_m="${_geox[3]:-https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/GeoLite2-ASN.mmdb}"
+
+  if grep -q '^geox-url:' "$dest" 2>/dev/null; then
+    sed -i \
+      -E "s|^([[:space:]]*geoip:).*|\1 \"${geoip_m}\"|" \
+      -E "s|^([[:space:]]*geosite:).*|\1 \"${geosite_m}\"|" \
+      -E "s|^([[:space:]]*mmdb:).*|\1 \"${mmdb_m}\"|" \
+      -E "s|^([[:space:]]*asn:).*|\1 \"${asn_m}\"|" \
+      "$dest" 2>/dev/null || true
+    grep -qE '^[[:space:]]*mmdb:' "$dest" || {
+      sed -i "/^geox-url:/a\\  mmdb: \"${mmdb_m}\"" "$dest" 2>/dev/null || true
+    }
+  else
+    cat >> "$dest" <<EOF
+
+# vps_auto: geox 国内镜像（MMDB/geoip 无代理可下载）
+geodata-mode: true
+geox-url:
+  geoip: "${geoip_m}"
+  geosite: "${geosite_m}"
+  mmdb: "${mmdb_m}"
+  asn: "${asn_m}"
+EOF
+  fi
+  ok "已配置 geox-url 国内镜像（country.mmdb / geoip / geosite）"
 }
 
 setup_clash_zshrc() {

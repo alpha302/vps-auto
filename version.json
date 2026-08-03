@@ -1,7 +1,7 @@
 {
-  "version": "1.5.2",
+  "version": "1.5.3",
   "script_url": "https://raw.githubusercontent.com/alpha302/vps-auto/main/vps_auto_work_cc.sh",
-  "sha256": "35833dea3f25cf6b05f01d747e744867097c2a4e9b462da3d629fc6b1b7b25bd",
-  "released_at": "2026-07-27T07:58:59Z",
-  "changelog": "fix(vps): mcp-apt-check 提示 -update-tools"
+  "sha256": "1022e78cdfa53f3df1ba46f3791147f03ae2437157944af8af4ae7fd59fd99cd",
+  "released_at": "2026-08-03T08:53:49Z",
+  "changelog": "fix(vps): v1.5.3 clash MMDB/GEO 改用国内 CDN 镜像"
 }

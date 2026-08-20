@@ -16,7 +16,7 @@
 set -uo pipefail
 
 # ───────────────────────── 基础变量 ─────────────────────────
-SCRIPT_VERSION="1.5.3"
+SCRIPT_VERSION="1.5.4"
 SCRIPT_NAME="$(basename "$0")"
 LOG_FILE="/var/log/vps_init.log"
 REGION_CONFIG="/etc/vps_init.conf"
@@ -813,37 +813,80 @@ install_docker() {
     remove_conflicting_docker_packages
   fi
 
+  local install_ok=1
   if [ "$need_install" -eq 1 ]; then
     remove_conflicting_docker_packages
-    apt_update || { err "apt-get update 失败"; return 1; }
-    apt_install ca-certificates curl gnupg lsb-release || return 1
-    mkdir -p /etc/apt/keyrings
-
-    if [ "$IS_CN" = "yes" ]; then
-      log "使用阿里云源安装 docker-ce（${codename}）..."
-      import_docker_gpg "https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg" || return 1
-      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://mirrors.aliyun.com/docker-ce/linux/ubuntu ${codename} stable" \
-        > /etc/apt/sources.list.d/docker.list
+    if ! apt_update; then
+      err "apt-get update 失败"
+      install_ok=0
+    elif ! apt_install ca-certificates curl gnupg lsb-release; then
+      install_ok=0
     else
-      log "使用 Docker 官方源安装 docker-ce（${codename}）..."
-      import_docker_gpg "https://download.docker.com/linux/ubuntu/gpg" || return 1
-      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${codename} stable" \
-        > /etc/apt/sources.list.d/docker.list
+      mkdir -p /etc/apt/keyrings
+      if [ "$IS_CN" = "yes" ]; then
+        log "使用阿里云源安装 docker-ce（${codename}）..."
+        if ! import_docker_gpg "https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg"; then
+          install_ok=0
+        else
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://mirrors.aliyun.com/docker-ce/linux/ubuntu ${codename} stable" \
+            > /etc/apt/sources.list.d/docker.list
+        fi
+      else
+        log "使用 Docker 官方源安装 docker-ce（${codename}）..."
+        if ! import_docker_gpg "https://download.docker.com/linux/ubuntu/gpg"; then
+          install_ok=0
+        else
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${codename} stable" \
+            > /etc/apt/sources.list.d/docker.list
+        fi
+      fi
+      if [ "$install_ok" -eq 1 ]; then
+        if ! apt_update || ! apt_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin; then
+          err "docker-ce 安装失败（代号 ${codename}），请查看 ${LOG_FILE}"
+          install_ok=0
+        fi
+      fi
     fi
-
-    apt_update || return 1
-    apt_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
-      || { err "docker-ce 安装失败（代号 ${codename}），请查看 ${LOG_FILE}"; return 1; }
   fi
 
+  # 无论 apt 安装是否成功，国内环境都先写 registry-mirrors（避免 -all 因 GPG/apt 失败提前 return 导致加速未配置）
+  write_docker_daemon_json
+
+  if [ "$install_ok" -ne 1 ] && ! command -v docker >/dev/null 2>&1; then
+    err "docker 未安装且包安装失败，daemon 加速配置已写入（若稍后装好 docker 请: systemctl restart docker）"
+    return 1
+  fi
+
+  systemctl daemon-reload
+  systemctl enable docker >> "$LOG_FILE" 2>&1
+  systemctl restart docker >> "$LOG_FILE" 2>&1
+
+  if command -v docker >/dev/null 2>&1 && systemctl is-active docker >/dev/null 2>&1; then
+    ok "docker-ce 安装/配置完成（${codename}，日志单文件上限50m，最多保留3个文件）"
+    if [ "$IS_CN" = "yes" ]; then
+      ok "已启用国内 registry-mirrors（xuanyuan / 1ms / daocloud）"
+    fi
+    docker --version | tee -a "$LOG_FILE"
+    docker compose version 2>/dev/null | tee -a "$LOG_FILE" || true
+  else
+    err "docker 服务未正常运行，请检查: journalctl -u docker -n 50"
+    return 1
+  fi
+}
+
+# 写入 /etc/docker/daemon.json（国内含 registry-mirrors）
+write_docker_daemon_json() {
   mkdir -p /etc/docker
   local registry_block=""
   if [ "$IS_CN" = "yes" ]; then
+    log "写入 Docker 国内镜像加速（registry-mirrors）..."
     registry_block='"registry-mirrors": [
-    "https://docker.m.daocloud.io",
-    "https://mirror.ccs.tencentyun.com",
-    "https://mirror.baidubce.com"
+    "https://docker.xuanyuan.me",
+    "https://docker.1ms.run",
+    "https://docker.m.daocloud.io"
   ],'
+  else
+    log "海外/官方源模式：不写入 registry-mirrors"
   fi
 
   cat > /etc/docker/daemon.json <<EOF
@@ -856,19 +899,7 @@ install_docker() {
   }
 }
 EOF
-
-  systemctl daemon-reload
-  systemctl enable docker >> "$LOG_FILE" 2>&1
-  systemctl restart docker >> "$LOG_FILE" 2>&1
-
-  if command -v docker >/dev/null 2>&1 && systemctl is-active docker >/dev/null 2>&1; then
-    ok "docker-ce 安装/配置完成（${codename}，日志单文件上限50m，最多保留3个文件）"
-    docker --version | tee -a "$LOG_FILE"
-    docker compose version 2>/dev/null | tee -a "$LOG_FILE" || true
-  else
-    err "docker 服务未正常运行，请检查: journalctl -u docker -n 50"
-    return 1
-  fi
+  ok "已更新 /etc/docker/daemon.json"
 }
 
 # ───────────────────────── 4. pip 源 ─────────────────────────

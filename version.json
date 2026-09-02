@@ -1,7 +1,7 @@
 {
-  "version": "1.5.4",
+  "version": "1.5.5",
   "script_url": "https://raw.githubusercontent.com/alpha302/vps-auto/main/vps_auto_work_cc.sh",
-  "sha256": "ad92d7733c416fa7359a012eb65223a3ac6f1fa4863d443c1cc0b36d7197275c",
-  "released_at": "2026-08-20T06:57:22Z",
-  "changelog": "fix: 国内 Docker registry-mirrors 更新为 xuanyuan/1ms/daocloud；apt/GPG 失败时仍写入 daemon.json"
+  "sha256": "a30c53e61d548b9ed40ecd5f7a90feff47396ea4c4c2ff3c491223440d3ce729",
+  "released_at": "2026-09-02T08:10:39Z",
+  "changelog": "feat: Go 升级至 1.27.1；已装版本 <1.25.0 或低于目标时自动卸载重装，等于目标则仅确保 PATH/GOPATH/GOPROXY"
 }

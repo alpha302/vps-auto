@@ -16,7 +16,7 @@
 set -uo pipefail
 
 # ───────────────────────── 基础变量 ─────────────────────────
-SCRIPT_VERSION="1.5.4"
+SCRIPT_VERSION="1.5.5"
 SCRIPT_NAME="$(basename "$0")"
 LOG_FILE="/var/log/vps_init.log"
 REGION_CONFIG="/etc/vps_init.conf"
@@ -1392,15 +1392,76 @@ EOF
 }
 
 # ───────────────────────── 7. golang ─────────────────────────
+# 返回 0 当且仅当 A < B（版本号，sort -V）
+go_version_lt() {
+  local A="$1" B="$2"
+  printf '%s\n%s\n' "$A" "$B" | sort -V | head -1 | grep -qx "$A" && [ "$A" != "$B" ]
+}
+
+# 确保 PATH / GOPATH / GOPROXY（zshrc + /etc/profile.d）
+_golang_ensure_env() {
+  local gopath="$HOME/go"
+  [ "$(id -u)" -eq 0 ] && gopath="/root/go"
+
+  zshrc_append "golang" "export PATH=\$PATH:/usr/local/go/bin
+export GOPATH=${gopath}
+export PATH=\$PATH:\$GOPATH/bin"
+
+  if [ "$IS_CN" = "yes" ]; then
+    zshrc_append "goproxy" '# clash off 时的默认 Go 模块源（clash on 会覆盖）
+export GOPROXY=https://goproxy.cn,direct
+export GOSUMDB=sum.golang.org'
+  fi
+
+  cat > /etc/profile.d/golang.sh <<EOF
+export PATH=\$PATH:/usr/local/go/bin:${gopath}/bin
+export GOPATH=${gopath}
+EOF
+}
+
 install_golang() {
   log "===== 安装 Golang ====="
-  local go_ver="1.22.5"
+  local go_ver="1.27.1"
+  local GO_MIN_KEEP="1.25.0"
   local arch="amd64"
   case "$(uname -m)" in
     aarch64|arm64) arch="arm64" ;;
   esac
-  local tarball="/tmp/go${go_ver}.linux-${arch}.tar.gz"
 
+  local go_bin="" installed_ver=""
+  if [ -x /usr/local/go/bin/go ]; then
+    go_bin="/usr/local/go/bin/go"
+  elif command -v go >/dev/null 2>&1; then
+    go_bin="$(command -v go)"
+  fi
+  if [ -n "$go_bin" ]; then
+    installed_ver="$("$go_bin" version 2>/dev/null | sed -n 's/.*go\([0-9][0-9.]*\).*/\1/p')"
+  fi
+
+  local need_install=0
+  if [ -z "$installed_ver" ]; then
+    log "未检测到 Go，将安装 ${go_ver}"
+    need_install=1
+  elif [ "$installed_ver" = "$go_ver" ]; then
+    log "已安装 Go ${installed_ver}，跳过重装，仅确保 PATH/GOPATH/GOPROXY"
+    need_install=0
+  elif go_version_lt "$installed_ver" "$GO_MIN_KEEP" || \
+       { ! go_version_lt "$installed_ver" "$GO_MIN_KEEP" && go_version_lt "$installed_ver" "$go_ver"; }; then
+    # < 1.25.0，或 >= 1.25 且 < 目标版本 → 卸载并重装
+    log "当前 Go ${installed_ver} 低于目标 ${go_ver}（保留下限 ${GO_MIN_KEEP}），将重装"
+    need_install=1
+  else
+    log "当前 Go ${installed_ver} 不低于目标 ${go_ver}，跳过重装，仅确保 PATH/GOPATH/GOPROXY"
+    need_install=0
+  fi
+
+  if [ "$need_install" -eq 0 ]; then
+    _golang_ensure_env
+    ok "Golang 环境已就绪: $([ -x /usr/local/go/bin/go ] && /usr/local/go/bin/go version || go version 2>/dev/null)"
+    return 0
+  fi
+
+  local tarball="/tmp/go${go_ver}.linux-${arch}.tar.gz"
   rm -f "$tarball"
   local go_urls=()
   if [ "$IS_CN" = "yes" ]; then
@@ -1439,24 +1500,7 @@ install_golang() {
   tar -C /usr/local -xzf "$tarball" >> "$LOG_FILE" 2>&1
   rm -f "$tarball"
 
-  local gopath="$HOME/go"
-  [ "$(id -u)" -eq 0 ] && gopath="/root/go"
-
-  zshrc_append "golang" "export PATH=\$PATH:/usr/local/go/bin
-export GOPATH=${gopath}
-export PATH=\$PATH:\$GOPATH/bin"
-
-  if [ "$IS_CN" = "yes" ]; then
-    zshrc_append "goproxy" '# clash off 时的默认 Go 模块源（clash on 会覆盖）
-export GOPROXY=https://goproxy.cn,direct
-export GOSUMDB=sum.golang.org'
-  fi
-
-  cat > /etc/profile.d/golang.sh <<EOF
-export PATH=\$PATH:/usr/local/go/bin:${gopath}/bin
-export GOPATH=${gopath}
-EOF
-
+  _golang_ensure_env
   ok "Golang ${go_ver} 安装完成: $(/usr/local/go/bin/go version 2>/dev/null)"
 }
 

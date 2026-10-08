@@ -15,8 +15,12 @@
 #
 set -uo pipefail
 
+# git 全局非交互：gitee/github 对不存在或需授权的仓库会回落到 "Username for 'https://...'" 提示，
+# 在无终端的自动化执行中会永久挂死（曾导致 oh-my-zsh clone 中断、留下残缺仓库）
+export GIT_TERMINAL_PROMPT=0
+
 # ───────────────────────── 基础变量 ─────────────────────────
-SCRIPT_VERSION="1.5.5"
+SCRIPT_VERSION="1.5.7"
 SCRIPT_NAME="$(basename "$0")"
 LOG_FILE="/var/log/vps_init.log"
 REGION_CONFIG="/etc/vps_init.conf"
@@ -326,6 +330,111 @@ zshrc_set() {
   ok "已写入 .zshrc: ${marker}"
 }
 
+# oh-my-zsh 核心完整性判定：只认 oh-my-zsh.sh + lib/，不认目录本身
+# 背景：clone 被中断会留下「有 .git 但无 commit」的残缺仓库——目录在、文件全空，
+#       官方/gitee 的 install.sh 见目录已存在会直接退出，不会自动修复，
+#       于是 .zshrc 每次登录都报 no such file or directory: /root/.oh-my-zsh/oh-my-zsh.sh
+omz_core_ok() {
+  local omz_home="${1:-${HOME}/.oh-my-zsh}"
+  [ -f "${omz_home}/oh-my-zsh.sh" ] && [ -n "$(ls -A "${omz_home}/lib" 2>/dev/null)" ]
+}
+
+# 校验并自愈 oh-my-zsh 核心；残缺时重新克隆，并原样还原 custom/ 下已装插件
+ensure_omz_core() {
+  local omz_home="${HOME}/.oh-my-zsh"
+  [ "$(id -u)" -eq 0 ] && omz_home="/root/.oh-my-zsh"
+
+  if omz_core_ok "$omz_home"; then
+    ok "oh-my-zsh 核心完整（oh-my-zsh.sh + lib/ 已就位）"
+    return 0
+  fi
+
+  local bak=""
+  if [ -d "$omz_home" ]; then
+    warn "检测到 ${omz_home} 残缺（缺 oh-my-zsh.sh，多为 clone 中断所致），开始自愈..."
+    bak="${omz_home}.broken.$(date +%Y%m%d%H%M%S)"
+    if ! mv "$omz_home" "$bak"; then
+      err "无法移开残缺目录 ${omz_home}"
+      return 1
+    fi
+    log "残缺目录已备份至 ${bak}（custom/ 插件稍后自动还原）"
+  else
+    log "未检测到 oh-my-zsh，开始安装..."
+  fi
+
+  local urls tmp url
+  if [ "$IS_CN" = "yes" ]; then
+    urls="https://gitee.com/mirrors/oh-my-zsh.git https://github.com/ohmyzsh/ohmyzsh.git"
+  else
+    urls="https://github.com/ohmyzsh/ohmyzsh.git https://gitee.com/mirrors/oh-my-zsh.git"
+  fi
+
+  tmp=$(mktemp -d)
+  for url in $urls; do
+    log "尝试克隆 oh-my-zsh: ${url}"
+    if git clone --depth=1 "$url" "${tmp}/omz" >>"$LOG_FILE" 2>&1 && omz_core_ok "${tmp}/omz"; then
+      mv "${tmp}/omz" "$omz_home"
+      rm -rf "$tmp"
+      # 还原备份里的自定义插件/主题（新仓库自带的 example 会被同名覆盖，无副作用）
+      if [ -n "$bak" ] && [ -d "${bak}/custom" ]; then
+        mkdir -p "${omz_home}/custom/plugins" "${omz_home}/custom/themes"
+        cp -a "${bak}/custom/plugins/." "${omz_home}/custom/plugins/" 2>>"$LOG_FILE" || true
+        cp -a "${bak}/custom/themes/." "${omz_home}/custom/themes/" 2>>"$LOG_FILE" || true
+        ok "已从 ${bak} 还原 custom 插件/主题"
+      fi
+      ok "oh-my-zsh 核心安装/修复完成（来源: ${url}）"
+      return 0
+    fi
+    rm -rf "${tmp}/omz"
+    warn "克隆失败或结果不完整: ${url}"
+  done
+  rm -rf "$tmp"
+
+  err "所有源均无法获取完整 oh-my-zsh，请检查网络或代理（clash on）"
+  # 回滚：还原原目录，避免用户环境比修复前更糟
+  if [ -n "$bak" ] && [ -d "$bak" ] && [ ! -d "$omz_home" ]; then
+    mv "$bak" "$omz_home" && warn "已回滚至原目录 ${omz_home}"
+  fi
+  return 1
+}
+
+# 克隆/自愈单个 oh-my-zsh 自定义插件
+# 判定依据是插件入口文件而非目录：clone 中断会留下空目录，只判断目录会导致永久跳过修复
+ensure_omz_plugin() {
+  local name="$1" entry="$2" cn_url="$3" gh_url="$4"
+  local dest="${ZSH_CUSTOM:-${HOME}/.oh-my-zsh/custom}/plugins/${name}"
+  local urls url
+
+  if [ -f "${dest}/${entry}" ]; then
+    ok "插件已就位: ${name}"
+    return 0
+  fi
+
+  if [ -d "$dest" ]; then
+    warn "插件 ${name} 残缺（缺 ${entry}），移除后重新克隆"
+    rm -rf "$dest"
+  fi
+
+  if [ "$IS_CN" = "yes" ]; then
+    urls="${cn_url} ${gh_url}"
+  else
+    urls="${gh_url} ${cn_url}"
+  fi
+
+  for url in $urls; do
+    log "克隆插件 ${name}: ${url}"
+    if git clone --depth=1 "$url" "$dest" >>"$LOG_FILE" 2>&1 && [ -f "${dest}/${entry}" ]; then
+      ok "插件安装完成: ${name}（来源: ${url}）"
+      return 0
+    fi
+    rm -rf "$dest"
+    warn "克隆失败或结果不完整: ${url}"
+  done
+
+  err "插件 ${name} 所有源均不可用"
+  return 1
+}
+
 # oh-my-zsh 核心引导：KEEP_ZSHRC=yes 时旧 .zshrc 可能只有 plugins= 行但无 source，主题/高亮均不生效
 # zsh-syntax-highlighting 必须位于 plugins 数组末尾
 ensure_omz_bootstrap() {
@@ -333,7 +442,10 @@ ensure_omz_bootstrap() {
   local omz_plugins="git autojump zsh-autosuggestions zsh-syntax-highlighting"
 
   touch "$ZSHRC"
-  [ ! -d "$omz_home" ] && { warn "未找到 ${omz_home}，跳过 .zshrc 核心修复"; return 1; }
+  if ! omz_core_ok "$omz_home"; then
+    warn "${omz_home} 核心不可用，跳过 .zshrc 核心修复"
+    return 1
+  fi
 
   if grep -qE 'source\s+(\$ZSH|\$\{ZSH\})/oh-my-zsh\.sh' "$ZSHRC" 2>/dev/null; then
     sed -i "s/^plugins=.*/plugins=(${omz_plugins})/" "$ZSHRC"
@@ -626,35 +738,43 @@ install_zsh() {
   ok "已将默认 shell 切换为 zsh（用户: ${target_user}，需重新登录生效）"
 
   # 安装 oh-my-zsh（国内/国外不同源）
+  # 注意：install.sh 遇到已存在目录会直接退出，无法修复「clone 中断留下的残缺仓库」，
+  #       因此安装后统一交由 ensure_omz_core 校验并自愈
   export RUNZSH=no CHSH=no KEEP_ZSHRC=yes
-  if [ "$IS_CN" = "yes" ]; then
+  if omz_core_ok "/root/.oh-my-zsh" || omz_core_ok "${HOME}/.oh-my-zsh"; then
+    log "oh-my-zsh 核心已完整，跳过 install.sh"
+  elif [ "$IS_CN" = "yes" ]; then
     log "使用国内 gitee 镜像安装 oh-my-zsh..."
     sh -c "$(curl -fsSL https://gitee.com/mirrors/oh-my-zsh/raw/master/tools/install.sh)" "" --unattended >> "$LOG_FILE" 2>&1 \
-      || warn "oh-my-zsh gitee 安装失败，尝试官方源"
+      || warn "oh-my-zsh gitee 安装失败，转由 ensure_omz_core 重试"
   else
     log "使用官方源安装 oh-my-zsh..."
     sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended >> "$LOG_FILE" 2>&1 \
-      || warn "oh-my-zsh 官方源安装失败"
+      || warn "oh-my-zsh 官方源安装失败，转由 ensure_omz_core 重试"
   fi
 
   local ZSH_CUSTOM="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}"
   [ "$(id -u)" -eq 0 ] && ZSH_CUSTOM="/root/.oh-my-zsh/custom"
 
-  if [ ! -d "$HOME/.oh-my-zsh" ] && [ ! -d "/root/.oh-my-zsh" ]; then
-    err "oh-my-zsh 安装失败，跳过插件安装"
+  # 缺失或残缺都在此自愈；仅「目录存在」不算安装成功
+  if ! ensure_omz_core; then
+    err "oh-my-zsh 核心不可用，跳过插件安装"
     return 1
   fi
 
   mkdir -p "${ZSH_CUSTOM}/plugins"
-  if [ ! -d "${ZSH_CUSTOM}/plugins/zsh-syntax-highlighting" ]; then
-    git clone --depth=1 https://github.com/zsh-users/zsh-syntax-highlighting.git "${ZSH_CUSTOM}/plugins/zsh-syntax-highlighting" >> "$LOG_FILE" 2>&1 \
-      || warn "zsh-syntax-highlighting 克隆失败"
-  fi
-  if [ ! -d "${ZSH_CUSTOM}/plugins/zsh-autosuggestions" ]; then
-    git clone --depth=1 https://github.com/zsh-users/zsh-autosuggestions.git "${ZSH_CUSTOM}/plugins/zsh-autosuggestions" >> "$LOG_FILE" 2>&1 \
-      || warn "zsh-autosuggestions 克隆失败"
-  fi
-  ok "zsh 插件克隆完成"
+
+  # 入口文件缺失即判定残缺并自动重克隆（国内优先 gitee，失败回落 GitHub）
+  # 镜像地址须用 gitee.com/mirrors/*：旧的 keke-zhou、izsh-syntax-highlighting 仓库已失效
+  ensure_omz_plugin "zsh-syntax-highlighting" "zsh-syntax-highlighting.zsh" \
+    "https://gitee.com/mirrors/zsh-syntax-highlighting.git" \
+    "https://github.com/zsh-users/zsh-syntax-highlighting.git" \
+    || warn "zsh-syntax-highlighting 不可用，命令语法高亮将失效"
+
+  ensure_omz_plugin "zsh-autosuggestions" "zsh-autosuggestions.zsh" \
+    "https://gitee.com/mirrors/zsh-autosuggestions.git" \
+    "https://github.com/zsh-users/zsh-autosuggestions.git" \
+    || warn "zsh-autosuggestions 不可用，历史命令自动建议将失效"
 
   ensure_omz_bootstrap
 
@@ -1604,10 +1724,17 @@ beautify_terminal() {
     # 只显示静态 /etc/motd，不加载 /run/motd.dynamic
     sed -i -E 's/^(session\s+optional\s+pam_motd\.so\s+motd=\/run\/motd\.dynamic)/# \1/' /etc/pam.d/sshd
     sed -i -E 's/^#\s*(session\s+optional\s+pam_motd\.so\s+noupdate)/\1/' /etc/pam.d/sshd
+
+    # 清理 common-session 中可能存在的 pam_motd（避免与 sshd 中的重复显示）
+    if [ -f /etc/pam.d/common-session ]; then
+      sed -i -E 's/^(session.*pam_motd\.so)/# \1/' /etc/pam.d/common-session
+    fi
+
+    # sshd 中确保只有一个 pam_motd noupdate 条目
     if ! grep -qE '^session\s+optional\s+pam_motd\.so\s+noupdate' /etc/pam.d/sshd; then
       sed -i '/^@include common-session/a session    optional     pam_motd.so noupdate' /etc/pam.d/sshd
     fi
-    ok "已启用 pam_motd（仅显示 /etc/motd）"
+    ok "已启用 pam_motd（仅显示 /etc/motd，已去重）"
   fi
 
   if [ -f /etc/ssh/sshd_config ]; then
@@ -2760,8 +2887,20 @@ download_geo_databases() {
 # mihomo 固定版本回退（GitHub API 不可达时使用，仅输出 URL 到 stdout）
 mihomo_fallback_download_url() {
   local arch="$1"
-  local ver="v1.19.27"
-  local fname="mihomo-linux-${arch}-v3-go123-${ver}.gz"
+  local ver="v1.19.31"
+  # 检测 CPU v3 支持，不支持则回退到 compatible 版本
+  local has_v3="no"
+  if [ "$arch" = "amd64" ]; then
+    if grep -qw "avx2" /proc/cpuinfo 2>/dev/null && grep -qw "bmi2" /proc/cpuinfo 2>/dev/null && grep -qw "movbe" /proc/cpuinfo 2>/dev/null; then
+      has_v3="yes"
+    fi
+  fi
+  local fname
+  if [ "$has_v3" = "yes" ]; then
+    fname="mihomo-linux-${arch}-v3-go123-${ver}.gz"
+  else
+    fname="mihomo-linux-${arch}-compatible-${ver}.gz"
+  fi
   echo "https://github.com/MetaCubeX/mihomo/releases/download/${ver}/${fname}"
 }
 
@@ -2790,22 +2929,48 @@ resolve_mihomo_download_url() {
     | grep -E "mihomo-linux-${arch}.*\.gz$" \
     | grep -vE '\.(deb|rpm|pkg\.tar\.zst)$')
 
-  # 优先级：v3-go124 > v3-go123 > v3 > v2 > 标准版
-  for pat in \
-    "mihomo-linux-${arch}-v3-go124-" \
-    "mihomo-linux-${arch}-v3-go123-" \
-    "mihomo-linux-${arch}-v3-" \
-    "mihomo-linux-${arch}-v2-go124-" \
-    "mihomo-linux-${arch}-v2-go123-" \
-    "mihomo-linux-${arch}-v1-go124-" \
-    "mihomo-linux-${arch}-v1\.19\." \
-    "mihomo-linux-${arch}-"; do
-    url=$(echo "$urls" | grep "$pat" | head -1)
-    if [ -n "$url" ]; then
-      echo "$url"
-      return 0
+  # 检测 CPU 是否支持 x86-64-v3（avx2 + bmi2 + movbe）
+  local has_v3="no"
+  if [ "$arch" = "amd64" ]; then
+    if grep -qw "avx2" /proc/cpuinfo 2>/dev/null && grep -qw "bmi2" /proc/cpuinfo 2>/dev/null && grep -qw "movbe" /proc/cpuinfo 2>/dev/null; then
+      has_v3="yes"
     fi
-  done
+  fi
+
+  # 优先级：CPU 支持 v3 则优先 v3-go124 > v3-go123 > v3；否则用 compatible > v1
+  if [ "$has_v3" = "yes" ]; then
+    for pat in \
+      "mihomo-linux-${arch}-v3-go124-" \
+      "mihomo-linux-${arch}-v3-go123-" \
+      "mihomo-linux-${arch}-v3-" \
+      "mihomo-linux-${arch}-v2-go124-" \
+      "mihomo-linux-${arch}-v2-go123-" \
+      "mihomo-linux-${arch}-v1-go124-" \
+      "mihomo-linux-${arch}-v1\.19\." \
+      "mihomo-linux-${arch}-"; do
+      url=$(echo "$urls" | grep "$pat" | head -1)
+      if [ -n "$url" ]; then
+        echo "$url"
+        return 0
+      fi
+    done
+  else
+    for pat in \
+      "mihomo-linux-${arch}-compatible-" \
+      "mihomo-linux-${arch}-v1-go123-" \
+      "mihomo-linux-${arch}-v1-go124-" \
+      "mihomo-linux-${arch}-v1-" \
+      "mihomo-linux-${arch}-v2-go123-" \
+      "mihomo-linux-${arch}-v2-" \
+      "mihomo-linux-${arch}-"; do
+      url=$(echo "$urls" | grep "$pat" | head -1)
+      if [ -n "$url" ]; then
+        log_err "CPU 不支持 x86-64-v3，自动选择兼容版本: $(basename "$url")"
+        echo "$url"
+        return 0
+      fi
+    done
+  fi
 
   warn_err "Release 中未匹配到 linux-${arch} 包，使用固定版本回退 URL"
   mihomo_fallback_download_url "$arch"
